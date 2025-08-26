@@ -1,76 +1,113 @@
+# app.py
 
 import cv2
 import numpy as np
 import os
 import mediapipe as mp
+from collections import deque
 from tensorflow.keras.models import load_model
+import time
 
 # --- Setup ---
-# Using the lightweight Hands model for better performance
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-# Load the trained model and define the actions it was trained on
-# Make sure this list is IDENTICAL to the one in your training script
-actions = np.array(["A", "B", "C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"])
-model = load_model(os.path.join('Trained_Model', 'asl_alphabet_lstm.h5'))
+actions = np.array(["A", "B", "C", "D", "E", "F"])
+# Ensure you are using the simplified, faster model
+model = load_model(os.path.join("Trained_Model", "asl_alphabet_lstm.h5"))
 
 # --- Helper Function ---
 def extract_keypoints(results):
+    """Extracts hand landmarks and returns a flattened numpy array."""
     if results.multi_hand_landmarks:
         hand = results.multi_hand_landmarks[0]
         return np.array([[res.x, res.y, res.z] for res in hand.landmark]).flatten()
-    else:
-        return np.zeros(21*3)
+    return np.zeros(21 * 3)
 
-# --- Real-time Detection Logic ---
-sequence = []
-sentence = []
-predictions = []
-threshold = 0.8  # Confidence threshold
+# --- Real-time Detection Variables ---
+sequence = deque(maxlen=30)         # A rolling window of 30 frames for the model input
+predictions_history = deque(maxlen=10) # A short history of predictions for smoothing
+last_label = ""
+last_conf = 0.0
+frame_counter = 0                   # Counter to control prediction frequency
+
+# --- Constants for Detection Logic (Tune if needed) ---
+CONFIDENCE_THRESHOLD = 0.75         # Minimum confidence to consider a prediction valid.
+STABILITY_FRAMES = 5                # How many consecutive identical predictions to be considered "stable".
+PREDICTION_INTERVAL = 3             # Run prediction every 3 frames to boost FPS.
 
 cap = cv2.VideoCapture(0)
-# Set up the MediaPipe Hands model for high performance
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+prev_time = time.time()
+
 with mp_hands.Hands(
     model_complexity=0,
     max_num_hands=1,
     min_detection_confidence=0.5,
-    min_tracking_confidence=0.5) as hands:
-    
+    min_tracking_confidence=0.5,
+) as hands:
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Make detections
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(image)
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        frame_counter += 1
+        # Process frame for detection
+        frame = cv2.flip(frame, 1)
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # Draw landmarks
+        # Draw landmarks if a hand is visible
         if results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                image, results.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
+            mp_drawing.draw_landmarks(frame, results.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
 
-        # Prediction logic
+        # Always update the sequence with the latest keypoints
         keypoints = extract_keypoints(results)
         sequence.append(keypoints)
-        sequence = sequence[-30:]
 
-        if len(sequence) == 30:
+        # --- Continuous Prediction Logic ---
+        # Only run the expensive prediction logic periodically to save resources and boost FPS.
+        if len(sequence) == 30 and frame_counter % PREDICTION_INTERVAL == 0:
             res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
-            predictions.append(np.argmax(res))
+            max_prob = np.max(res)
+            current_prediction = actions[np.argmax(res)]
 
-            # Visualization logic
-            if np.unique(predictions[-10:])[0] == np.argmax(res):
-                if res[np.argmax(res)] > threshold:
-                    cv2.putText(image, actions[np.argmax(res)], (3, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+            # Check if the prediction is confident enough
+            if max_prob > CONFIDENCE_THRESHOLD:
+                predictions_history.append(current_prediction)
 
-        cv2.imshow('OpenCV Feed', image)
+                # NEW SMOOTHING LOGIC: Check for stability over the last few frames
+                if len(predictions_history) >= STABILITY_FRAMES:
+                    # Check if the last STABILITY_FRAMES predictions are all the same
+                    if len(set(list(predictions_history)[-STABILITY_FRAMES:])) == 1:
+                        # If stable, update the displayed label
+                        last_label = current_prediction
+                        last_conf = max_prob
+            else:
+                # If confidence drops, clear the history and the displayed label
+                predictions_history.clear()
+                last_label = ""
 
-        if cv2.waitKey(10) & 0xFF == ord('q'):
+        # Display the prediction on the screen
+        # MODIFIED: Removed the "else" block that showed "Starting..." and "Ready..."
+        if last_label != "":
+            cv2.putText(frame, f"{last_label} ({last_conf*100:.1f}%)",
+                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (255, 0, 0), 2, cv2.LINE_AA)
+
+        # Calculate and display FPS
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time)
+        prev_time = curr_time
+        cv2.putText(frame, f"FPS: {int(fps)}", (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2)
+
+        cv2.imshow("ASL Detection", frame)
+
+        if cv2.waitKey(10) & 0xFF == ord("q"):
             break
 
-    cap.release()
-    cv2.destroyAllWindows()
+cap.release()
+cv2.destroyAllWindows()
